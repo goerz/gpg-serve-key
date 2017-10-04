@@ -1,0 +1,317 @@
+#!/usr/bin/env python
+#  MIT License
+#
+# Copyright (c) 2017 Michael Goerz
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+#     The above copyright notice and this permission notice shall be included
+#     in all copies or substantial portions of the Software.
+#
+#     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+#     OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+#     MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+#     NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+#     DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+#     OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+#     USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+"""Serve a public/private GPG key over http(s)
+
+This script allows to transfer a public/private GPG key from a server to
+another device where communication is only possible over the https. Note that
+in general this should not be a first choice. For example, if you have ssh
+access, a better way to transfer a key would be
+
+    ssh user@remote gpg2 --export-secret-key KEYID | gpg2 --import
+
+However, transfer over https is usually a better choice than e.g. emailing an
+exported secret-key file to yourself. The one particular use case motivating
+this script was the import of a secret key into the [Pass iOS app][1]
+
+While transfer over https in principle makes it accessible to anyone, the
+script takes strong measures to protect the key data:
+
+*   They key is directly read through a pip from the `gpg` executable. The
+    secret key is never written to disk
+
+*   The server encrypts the communication with SSL (that is, using the https
+    protocol) by default. While this creates the additional overhead of
+    requiring valid SSL certificates for the public hostname under which the
+    server will be reached, it is essential to guarantee that the key cannot be
+    sniffed in transit. For use within a trusted network, the encryption can be
+    disabled, although you are strongly discouraged from doing so.
+
+*   The key is exposed at a url that contains a random token and using a random
+    port number (by default), e.g. for the KEYID 57A6CAA6
+
+        https://michaelgoerz.net:47409/v1f4Y7XixMQ/57A6CAA6-secret.key
+
+*   Brute-forcing the token is prevented through rate limiting, that is, by an
+    exponentially increasing delay after an invalid request
+
+*   The server responds with HTTP headers that disable caching by the client.
+*
+*   The server writes log messages about every served request. This allows to
+    monitor for unexpected access and to detect if the key has been compromised
+    (as a last resort)
+
+
+
+## Requirements ##
+
+*  Python >3.5
+*  [click package][2]
+*  A server that is accessible through a public hostname, with GPG installed
+   and the private key for the KEYID that is to be exported in its keychain
+*  SSL certificates for the public hostname. It is recommended to use
+   [Let's Encrypt][3]. You may use an existing certificate for a webserver
+   running on the host
+
+
+## Usage ##
+
+Run the script directly as e.g.
+
+    ./gpg-serve-key \
+        --cert-file=/etc/letsencrypt/live/michaelgoerz.net/cert.pem \
+        --key-file=/etc/letsencrypt/live/michaelgoerz.net/privkey.pem \
+        --host=michaelgoerz.net 57A6CAA6
+
+See `./gpg-serve-key --help` for more details.
+
+This will start temporary webserver at a random port and serve both the public
+and the private key at URLs such as
+
+    https://michaelgoerz.net:47409/v1f4Y7XixMQ/57A6CAA6-public.key
+    https://michaelgoerz.net:47409/v1f4Y7XixMQ/57A6CAA6-secret.key
+
+After importing the keys from these URLs, stop the serve by hitting `ctrl+c`.
+
+[1]: https://mssun.github.io/passforios/
+[2]: http://click.pocoo.org/5/
+[3]: https://letsencrypt.org
+
+"""
+import base64
+import io
+import logging
+import os
+import ssl
+import sys
+import time
+import types
+from subprocess import Popen, PIPE
+from http import HTTPStatus
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+
+import click
+
+
+__version__ = '0.1'
+
+
+class InvalidToken(ValueError):
+    pass
+
+
+class ShowKeyHTTPRequestHandler(SimpleHTTPRequestHandler):
+    """Respond to HTTP requests for key files"""
+
+    server_version = "ShowKeyHTTP/" + __version__
+    token = ''
+    rate_delay = 1
+    key_id = ''
+    gpg = 'gpg2'
+    secret_name = '{key_id}-secret.key'
+    public_name = '{key_id}-public.key'
+
+    def send_head(self):
+        """Common code for GET and HEAD commands.
+
+        This sends the response code and MIME headers.
+        """
+        f = None
+        secret_name = self.secret_name.format(key_id=self.key_id)
+        public_name = self.public_name.format(key_id=self.key_id)
+        if self.path.startswith("/" + self.token):
+            if self.path.endswith(secret_name):
+                cmd = [self.gpg, '--armor', '--export-secret-keys',
+                       self.key_id]
+            elif self.path.endswith(public_name):
+                cmd = [self.gpg, '--armor', '--export', self.key_id]
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+                return None
+            try:
+                with Popen(cmd, stdout=PIPE) as proc:
+                    data = proc.stdout.read()
+                    f = io.BytesIO(data)
+            except OSError:
+                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+                return None
+            try:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-type", 'text/plain')
+                self.send_header("Content-Length", len(data))
+                self.send_header("Cache-Control", 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header(
+                    'strict-transport-security',
+                    'max-age=31536000; includeSubDomains')
+                self.send_header('x-frame-options', 'SAMEORIGIN')
+                self.send_header('Referrer-Policy', 'no-referrer')
+                self.send_header('X-XSS-Protection', '1; mode=block')
+                self.send_header(
+                    'Content-Security-Policy', "default-src 'none'")
+                self.end_headers()
+                return f
+            except:
+                f.close()
+                raise
+        else:
+            if self.path == '/':
+                msg = "Missing token"
+                invalid_token = False
+            else:
+                self.__class__.rate_delay *= 2
+                msg = "Invalid token: %s. Sleep for %s seconds" % (
+                        self.path[1:], self.rate_delay)
+                invalid_token = True
+            self.send_error(
+                HTTPStatus.FORBIDDEN, msg)
+            if invalid_token:
+                raise InvalidToken(self.rate_delay)
+            return None
+
+
+def generate_token(nbytes):
+    """Generate a URL-safe one-time token with `nbytes` of entropy"""
+    tok = os.urandom(nbytes)
+    return base64.urlsafe_b64encode(tok).rstrip(b'=').decode('ascii')
+
+
+def handle_rate_delay(http_server, request, client_address):
+    """Handle an InvalidToken exception by sleeping for the duration of
+    `rate_delay` passed in the exception"""
+    type, exc, traceback = sys.exc_info()
+    if isinstance(exc, InvalidToken):
+        rate_delay = int(exc.args[0])
+        click.echo("sleeping for %d seconds (rate delay)" % rate_delay)
+        time.sleep(rate_delay)
+    else:
+        raise
+
+
+def run_server(
+        cert_file, key_file, host, key_id, port, gpg,
+        server_class=HTTPServer, handler_class=ShowKeyHTTPRequestHandler):
+    """Run the HTTPS server
+
+    Args:
+        cert_file (str): full path to SSL certificate file
+        key_file (str): full path to SSL private-key file
+        host (str): the public hostname where the server will be available. May
+            be the empty string to bind to every available network interface.
+            In general, set this to the domain for which the SSL certificate
+            was generated
+        key_id (str): The ID of the GPG key that should be exported.
+        port (int): the port number on which to run the server. If 0, a random
+            port will be selected
+        gpg (str): the name (or full path) to the gpg executable
+        server_class (class): Class that should be instantiated as the HTTP
+            server
+        handler_class (class): Class that should be instantiated to handle HTTP
+            requests
+    """
+
+    server_address = (host, port)
+    token = generate_token(nbytes=8)
+
+    handler_class.token = token
+    handler_class.key_id = key_id
+    handler_class.gpg = gpg
+    handler_class.secret_name = key_id + "-secret.key"
+    handler_class.public_name = key_id + "-public.key"
+
+    httpd = server_class(server_address, handler_class)
+    if cert_file is not None or key_file is not None:
+        protocol = 'https'
+        httpd.socket = ssl.wrap_socket(
+            httpd.socket, certfile=cert_file, keyfile=key_file,
+            server_side=True)
+    else:
+        protocol =  'http'
+    handler_class.have_fork = False
+    httpd.handle_error = types.MethodType(handle_rate_delay, httpd)
+
+    if port == 0:
+        port = httpd.socket.getsockname()[1]
+
+    if host == '':
+        host = '<host>'
+    click.echo(
+        "\nServer running ...\n\n"
+        "{protocol}://{host}:{port}/{token}/{public_name}\n"
+        "{protocol}://{host}:{port}/{token}/{secret_name}\n".format(
+            protocol=protocol, host=host, port=port, token=token,
+            public_name=handler_class.public_name,
+            secret_name=handler_class.secret_name))
+
+    try:
+        while True:
+            httpd.handle_request()
+    except KeyboardInterrupt:
+        click.echo("\nQuit.")
+
+
+@click.command()
+@click.help_option('--help', '-h')
+@click.version_option(version=__version__)
+@click.option(
+    '--debug', is_flag=True,
+    help='enable debug logging')
+@click.option(
+    '--cert-file', type=click.Path(exists=True),
+    help='SSL certificate file. Required unless --no-ssl is given.')
+@click.option(
+    '--key-file', type=click.Path(exists=True),
+    help='SSL key file. Required unless --no-ssl is given.')
+@click.option('--ssl/--no-ssl', default=True,
+    help='Whether to use encryption (https, on by default). '
+    'USE AN UNENCRYPTED CONNECTION AT YOUR OWN RISK.')
+@click.option('--host', default='', metavar='HOST',
+    help='hostname to which to bind the server. Defaults to binding to any '
+    'available interface')
+@click.option('--port', default=0,
+    help='port to which to bind the server. The default is to choose a '
+    'random port')
+@click.option('--gpg', default='gpg2', show_default=True, metavar='EXE',
+    help='gpg executable')
+@click.argument('key_id')
+def main(debug, cert_file, key_file, ssl, host, port, gpg, key_id):
+    """Serve the public and private GPG key with KEY_ID over https"""
+    logging.basicConfig(level=logging.WARNING)
+    logger = logging.getLogger(__name__)
+    if debug:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Enabled debug output")
+
+    if ssl:
+        if cert_file is None or key_file is None:
+            click.echo("--cert-file and --key-file must be given")
+            return None
+    else:
+        cert_file = None
+        key_file = None
+
+    run_server(cert_file, key_file, host, key_id, port, gpg)
+
+
+if __name__ == "__main__":
+    main()
