@@ -24,23 +24,23 @@
 """Serve a public/private GPG key over http(s)
 
 This script allows to transfer a public/private GPG key from a server to
-another device where communication is only possible over the https. Note that
-in general this should not be a first choice. For example, if you have ssh
+another device where communication is only possible over `https`. Note that
+in general this should not be a first choice. For example, if you have `ssh`
 access, a better way to transfer a key would be
 
     ssh user@remote gpg2 --export-secret-key KEYID | gpg2 --import
 
-However, transfer over https is usually a better choice than e.g. emailing an
+However, transfer over `https` is usually a better choice than e.g. emailing an
 exported secret-key file to yourself. The one particular use case motivating
-this script was the import of a secret key into the [Pass iOS app][1]
+this script was the import of a secret key into the [Pass iOS app][1].
 
-While transfer over https in principle makes it accessible to anyone, the
-script takes strong measures to protect the key data:
+While transfer over `https` in principle makes it accessible to anyone, the
+script takes strong measures to protect the key:
 
-*   They key is directly read through a pip from the `gpg` executable. The
+*   They key is directly read through a pipe from the `gpg` executable. The
     secret key is never written to disk
 
-*   The server encrypts the communication with SSL (that is, using the https
+*   The server encrypts the communication with SSL (that is, using the `https`
     protocol) by default. While this creates the additional overhead of
     requiring valid SSL certificates for the public hostname under which the
     server will be reached, it is essential to guarantee that the key cannot be
@@ -56,16 +56,18 @@ script takes strong measures to protect the key data:
     exponentially increasing delay after an invalid request
 
 *   The server responds with HTTP headers that disable caching by the client.
-*
+
 *   The server writes log messages about every served request. This allows to
     monitor for unexpected access and to detect if the key has been compromised
     (as a last resort)
 
+Through the `--serve-file` option, files in addition to the GPG key may be
+served (e.g. a private SSH key)
 
 
 ## Requirements ##
 
-*  Python >3.5
+*  Python >= 3.5
 *  [click package][2]
 *  A server that is accessible through a public hostname, with GPG installed
    and the private key for the KEYID that is to be exported in its keychain
@@ -91,7 +93,7 @@ and the private key at URLs such as
     https://michaelgoerz.net:47409/v1f4Y7XixMQ/57A6CAA6-public.key
     https://michaelgoerz.net:47409/v1f4Y7XixMQ/57A6CAA6-secret.key
 
-After importing the keys from these URLs, stop the serve by hitting `ctrl+c`.
+After importing the keys from these URLs, stop the server by hitting `ctrl+c`.
 
 [1]: https://mssun.github.io/passforios/
 [2]: http://click.pocoo.org/5/
@@ -116,49 +118,35 @@ import click
 __version__ = '0.1'
 
 
-class InvalidToken(ValueError):
+class InvalidAccess(ValueError):
     pass
 
 
-class ShowKeyHTTPRequestHandler(SimpleHTTPRequestHandler):
+class ServeKeyHTTPRequestHandler(SimpleHTTPRequestHandler):
     """Respond to HTTP requests for key files"""
 
-    server_version = "ShowKeyHTTP/" + __version__
-    token = ''
+    server_version = "ServeKeyHTTP/" + __version__
     rate_delay = 1
-    key_id = ''
-    gpg = 'gpg2'
-    secret_name = '{key_id}-secret.key'
-    public_name = '{key_id}-public.key'
+    url_map = {}  # url_path => data_source
 
     def send_head(self):
         """Common code for GET and HEAD commands.
 
         This sends the response code and MIME headers.
         """
-        f = None
-        secret_name = self.secret_name.format(key_id=self.key_id)
-        public_name = self.public_name.format(key_id=self.key_id)
-        if self.path.startswith("/" + self.token):
-            if self.path.endswith(secret_name):
-                cmd = [self.gpg, '--armor', '--export-secret-keys',
-                       self.key_id]
-            elif self.path.endswith(public_name):
-                cmd = [self.gpg, '--armor', '--export', self.key_id]
+        logger = logging.getLogger(__name__)
+        try:
+            data_source = self.url_map[self.path]
+            if isinstance(data_source, list):
+                fh, size = self.get_cmd(data_source)
+            elif isinstance(data_source, str):
+                fh, size = self.get_file(data_source)
             else:
-                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
-                return None
-            try:
-                with Popen(cmd, stdout=PIPE) as proc:
-                    data = proc.stdout.read()
-                    f = io.BytesIO(data)
-            except OSError:
-                self.send_error(HTTPStatus.NOT_FOUND, "File not found")
-                return None
+                raise ValueError("Invalid data_source type")
             try:
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-type", 'text/plain')
-                self.send_header("Content-Length", len(data))
+                self.send_header("Content-Length", size)
                 self.send_header("Cache-Control", 'no-store')
                 self.send_header('X-Content-Type-Options', 'nosniff')
                 self.send_header(
@@ -170,24 +158,35 @@ class ShowKeyHTTPRequestHandler(SimpleHTTPRequestHandler):
                 self.send_header(
                     'Content-Security-Policy', "default-src 'none'")
                 self.end_headers()
-                return f
+                return fh
             except:
-                f.close()
+                fh.close()
                 raise
-        else:
-            if self.path == '/':
-                msg = "Missing token"
-                invalid_token = False
-            else:
+        except (KeyError, OSError):
+            self.send_error(HTTPStatus.NOT_FOUND, "File not found")
+            if self.path != '/':
                 self.__class__.rate_delay *= 2
-                msg = "Invalid token: %s. Sleep for %s seconds" % (
-                        self.path[1:], self.rate_delay)
-                invalid_token = True
-            self.send_error(
-                HTTPStatus.FORBIDDEN, msg)
-            if invalid_token:
-                raise InvalidToken(self.rate_delay)
+                logger.debug(
+                    "sleeping for rate delay: %d seconds", self.rate_delay)
+                raise InvalidAccess(self.rate_delay)
             return None
+
+    @staticmethod
+    def get_file(file_path):
+        """Return an open file-handle to `file_path`, and the size of the
+        file"""
+        fh = open(file_path, 'rb')
+        fs = os.fstat(fh.fileno())
+        return fh, fs[6]
+
+    @staticmethod
+    def get_cmd(cmd):
+        """Return a file-handle to the stdout for cmd, and the size of the
+        stdout"""
+        with Popen(cmd, stdout=PIPE) as proc:
+            data = proc.stdout.read()
+            fh = io.BytesIO(data)
+        return fh, len(data)
 
 
 def generate_token(nbytes):
@@ -197,10 +196,10 @@ def generate_token(nbytes):
 
 
 def handle_rate_delay(http_server, request, client_address):
-    """Handle an InvalidToken exception by sleeping for the duration of
+    """Handle an InvalidAccess exception by sleeping for the duration of
     `rate_delay` passed in the exception"""
     type, exc, traceback = sys.exc_info()
-    if isinstance(exc, InvalidToken):
+    if isinstance(exc, InvalidAccess):
         rate_delay = int(exc.args[0])
         click.echo("sleeping for %d seconds (rate delay)" % rate_delay)
         time.sleep(rate_delay)
@@ -209,8 +208,8 @@ def handle_rate_delay(http_server, request, client_address):
 
 
 def run_server(
-        cert_file, key_file, host, key_id, port, gpg,
-        server_class=HTTPServer, handler_class=ShowKeyHTTPRequestHandler):
+        cert_file, key_file, host, key_id, port, gpg, extra_serve_files=None,
+        server_class=HTTPServer, handler_class=ServeKeyHTTPRequestHandler):
     """Run the HTTPS server
 
     Args:
@@ -224,6 +223,8 @@ def run_server(
         port (int): the port number on which to run the server. If 0, a random
             port will be selected
         gpg (str): the name (or full path) to the gpg executable
+        extra_serve_files (list or None): A list of files to serve in
+            addition to the GPG key
         server_class (class): Class that should be instantiated as the HTTP
             server
         handler_class (class): Class that should be instantiated to handle HTTP
@@ -233,11 +234,18 @@ def run_server(
     server_address = (host, port)
     token = generate_token(nbytes=8)
 
-    handler_class.token = token
-    handler_class.key_id = key_id
-    handler_class.gpg = gpg
-    handler_class.secret_name = key_id + "-secret.key"
-    handler_class.public_name = key_id + "-public.key"
+    url_map = {
+        "/%s/%s-secret.key" % (token, key_id):
+            [gpg, '--armor', '--export-secret-keys', key_id],
+        "/%s/%s-public.key" % (token, key_id):
+            [gpg, '--armor', '--export', key_id],
+    }
+    if extra_serve_files is not None:
+        for file_path in extra_serve_files:
+            url_path = "/%s/%s" % (token, os.path.split(file_path)[1])
+            url_map[url_path] = file_path
+
+    handler_class.url_map = url_map
 
     httpd = server_class(server_address, handler_class)
     if cert_file is not None or key_file is not None:
@@ -246,7 +254,7 @@ def run_server(
             httpd.socket, certfile=cert_file, keyfile=key_file,
             server_side=True)
     else:
-        protocol =  'http'
+        protocol = 'http'
     handler_class.have_fork = False
     httpd.handle_error = types.MethodType(handle_rate_delay, httpd)
 
@@ -255,14 +263,10 @@ def run_server(
 
     if host == '':
         host = '<host>'
-    click.echo(
-        "\nServer running ...\n\n"
-        "{protocol}://{host}:{port}/{token}/{public_name}\n"
-        "{protocol}://{host}:{port}/{token}/{secret_name}\n".format(
-            protocol=protocol, host=host, port=port, token=token,
-            public_name=handler_class.public_name,
-            secret_name=handler_class.secret_name))
-
+    click.echo("\nServer running ...\n")
+    for url_path in url_map:
+        click.echo("{protocol}://{host}:{port}{path}".format(
+            protocol=protocol, host=host, port=port, path=url_path))
     try:
         while True:
             httpd.handle_request()
@@ -282,19 +286,26 @@ def run_server(
 @click.option(
     '--key-file', type=click.Path(exists=True),
     help='SSL key file. Required unless --no-ssl is given.')
-@click.option('--ssl/--no-ssl', default=True,
+@click.option(
+    '--ssl/--no-ssl', default=True,
     help='Whether to use encryption (https, on by default). '
     'USE AN UNENCRYPTED CONNECTION AT YOUR OWN RISK.')
-@click.option('--host', default='', metavar='HOST',
+@click.option(
+    '--host', default='', metavar='HOST',
     help='hostname to which to bind the server. Defaults to binding to any '
-    'available interface')
-@click.option('--port', default=0,
+    'available interface.')
+@click.option(
+    '--port', default=0,
     help='port to which to bind the server. The default is to choose a '
-    'random port')
-@click.option('--gpg', default='gpg2', show_default=True, metavar='EXE',
+    'random port.')
+@click.option(
+    '--gpg', default='gpg2', show_default=True, metavar='EXE',
     help='gpg executable')
+@click.option(
+    '--serve-file', '-f', multiple=True, type=click.Path(exists=True),
+    help='Additional file to serve. This option can be given multiple times.')
 @click.argument('key_id')
-def main(debug, cert_file, key_file, ssl, host, port, gpg, key_id):
+def main(debug, cert_file, key_file, ssl, host, port, gpg, serve_file, key_id):
     """Serve the public and private GPG key with KEY_ID over https"""
     logging.basicConfig(level=logging.WARNING)
     logger = logging.getLogger(__name__)
@@ -310,7 +321,9 @@ def main(debug, cert_file, key_file, ssl, host, port, gpg, key_id):
         cert_file = None
         key_file = None
 
-    run_server(cert_file, key_file, host, key_id, port, gpg)
+    run_server(
+        cert_file, key_file, host, key_id, port, gpg,
+        extra_serve_files=serve_file)
 
 
 if __name__ == "__main__":

@@ -38,6 +38,8 @@ script takes strong measures to protect the key:
     monitor for unexpected access and to detect if the key has been compromised
     (as a last resort)
 
+Through the `--serve-file` option, files in addition to the GPG key may be
+served (e.g. a private SSH key)
 
 
 ## Requirements ##
