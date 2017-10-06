@@ -278,7 +278,7 @@ def run_server(
 @click.help_option('--help', '-h')
 @click.version_option(version=__version__)
 @click.option(
-    '--debug', is_flag=True,
+    '--debug', '-d', is_flag=True,
     help='enable debug logging')
 @click.option(
     '--cert-file', type=click.Path(exists=True),
@@ -291,11 +291,11 @@ def run_server(
     help='Whether to use encryption (https, on by default). '
     'USE AN UNENCRYPTED CONNECTION AT YOUR OWN RISK.')
 @click.option(
-    '--host', default='', metavar='HOST',
+    '--host', '-H', default='', metavar='HOST',
     help='hostname to which to bind the server. Defaults to binding to any '
     'available interface.')
 @click.option(
-    '--port', default=0,
+    '--port', '-p', default=0, metavar='PORT',
     help='port to which to bind the server. The default is to choose a '
     'random port.')
 @click.option(
@@ -304,7 +304,7 @@ def run_server(
 @click.option(
     '--serve-file', '-f', multiple=True, type=click.Path(exists=True),
     help='Additional file to serve. This option can be given multiple times.')
-@click.argument('key_id')
+@click.argument('KEY_ID')
 def main(debug, cert_file, key_file, ssl, host, port, gpg, serve_file, key_id):
     """Serve the public and private GPG key with KEY_ID over https"""
     logging.basicConfig(level=logging.WARNING)
